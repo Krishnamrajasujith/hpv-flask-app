@@ -12,7 +12,7 @@ app = Flask(__name__)
 app.secret_key = "hpv_super_secret_key"
 
 DATABASE = "users.db"
-MODEL_PATH = "rf_smote_model.pkl"
+MODEL_PATH = "rf_model.pkl"
 
 # ================= CREATE DATABASE =================
 def init_db():
@@ -42,6 +42,7 @@ class VirusDetector:
     def __init__(self):
         self.model = None
         self.is_trained = False
+        self.used_genes = None
         self.load_model()
 
     def load_model(self):
@@ -51,38 +52,72 @@ class VirusDetector:
 
     def train_model(self, file):
         df = pd.read_csv(file)
-        required_columns = TOP_GENES + ['HPV_Status']
-        for col in required_columns:
-            if col not in df.columns:
-                raise KeyError(f"Missing column: {col}")
+        df.columns = df.columns.str.strip()
 
-        X = df[TOP_GENES]
+        if 'HPV_Status' not in df.columns:
+            raise KeyError("HPV_Status column is required for training")
+
+        available_genes = [g for g in TOP_GENES if g in df.columns]
+
+        if len(available_genes) < 5:
+            raise KeyError("Not enough valid gene columns found")
+
+        df[available_genes] = df[available_genes].apply(
+            pd.to_numeric, errors='coerce'
+        )
+
+        df = df.dropna()
+
+        if len(df) < 4:
+            raise ValueError("Dataset too small for training")
+
+        X = df[available_genes]
         y = df['HPV_Status']
 
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=0.2, random_state=42
         )
 
-        smote = SMOTE(random_state=42)
-        X_train_smote, y_train_smote = smote.fit_resample(X_train, y_train)
+        # Apply SMOTE only if enough minority samples
+        if y_train.value_counts().min() >= 6:
+            smote = SMOTE(random_state=42)
+            X_train, y_train = smote.fit_resample(X_train, y_train)
 
-        self.model = RandomForestClassifier(n_estimators=200, random_state=42)
-        self.model.fit(X_train_smote, y_train_smote)
+        self.model = RandomForestClassifier(
+            n_estimators=200,
+            random_state=42
+        )
+
+        self.model.fit(X_train, y_train)
 
         joblib.dump(self.model, MODEL_PATH)
         self.is_trained = True
+        self.used_genes = available_genes
 
-        auc = roc_auc_score(y_test, self.model.predict_proba(X_test)[:,1])
+        auc = roc_auc_score(y_test, self.model.predict_proba(X_test)[:, 1])
         return auc
 
     def predict(self, file):
+        if not self.is_trained:
+            raise ValueError("Model not trained")
+
         df = pd.read_csv(file)
-        for col in TOP_GENES:
-            if col not in df.columns:
-                raise KeyError(f"Missing column: {col}")
+        df.columns = df.columns.str.strip()
+
+        available_genes = [g for g in TOP_GENES if g in df.columns]
+
+        if len(available_genes) < 5:
+            raise KeyError("Not enough valid gene columns for prediction")
+
+        df[available_genes] = df[available_genes].apply(
+            pd.to_numeric, errors='coerce'
+        )
+
+        df = df.dropna()
 
         row = df.iloc[0]
-        sample = [row[gene] for gene in TOP_GENES]
+        sample = [row[g] for g in available_genes]
+
         prob = self.model.predict_proba([sample])[0][1]
         return prob
 
@@ -194,15 +229,9 @@ def train():
         <h4>AUC Score: {round(auc,3)}</h4>
         <a href='/dashboard'>Back</a>
         """
-    except KeyError as e:
-        return f"""
-        <h3 style='color:red;'>Training Failed ❌</h3>
-        <p>{str(e)}</p>
-        <a href='/dashboard'>Back</a>
-        """
     except Exception as e:
         return f"""
-        <h3 style='color:red;'>Unexpected Error ❌</h3>
+        <h3 style='color:red;'>Training Failed ❌</h3>
         <p>{str(e)}</p>
         <a href='/dashboard'>Back</a>
         """
@@ -213,9 +242,6 @@ def predict():
     if 'user' not in session:
         return redirect(url_for('login'))
     try:
-        if not detector.is_trained:
-            return "<h3>Model not trained yet.</h3><a href='/dashboard'>Back</a>"
-
         file = request.files['file']
         prob = detector.predict(file)
         status = "HPV16 Positive" if prob > 0.5 else "HPV16 Negative"
@@ -226,7 +252,7 @@ def predict():
         <h4>Confidence: {round(prob*100,2)}%</h4>
         <a href='/dashboard'>Back</a>
         """
-    except KeyError as e:
+    except Exception as e:
         return f"""
         <h3 style='color:red;'>Prediction Failed ❌</h3>
         <p>{str(e)}</p>
@@ -241,5 +267,5 @@ def logout():
 
 # ================= RUN SERVER =================
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))  # required for cloud deployment
+    port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
